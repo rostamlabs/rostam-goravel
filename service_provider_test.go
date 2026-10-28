@@ -18,6 +18,11 @@ func TestBindingsRefuseAMissingOrMistypedName(t *testing.T) {
 	app := mocksfoundation.NewApplication(t)
 	bindings := map[any]bindingFunc{}
 
+	// Register stores the application in the package-global App; put back
+	// whatever was there so no later test sees this mock.
+	previous := App
+	t.Cleanup(func() { App = previous })
+
 	app.EXPECT().BindWith(mock.Anything, mock.Anything).Run(func(key any, callback func(foundation.Application, map[string]any) (any, error)) {
 		bindings[key] = callback
 	}).Times(2)

@@ -78,13 +78,17 @@ func (s *SessionTestSuite) TestPrefixDefaultsToTheCookieName() {
 }
 
 func (s *SessionTestSuite) TestPrefixCanBeConfigured() {
-	s.config.Add("session.drivers."+testSessionDriver+".prefix", "custom:")
+	// Unique per run, like every other key these tests write: a fixed one
+	// would be shared by repeated and concurrent runs on the same server.
+	prefix := "custom-" + randomSuffix() + ":"
+	s.config.Add("session.drivers."+testSessionDriver+".prefix", prefix)
 
 	session, err := NewSession(context.Background(), s.config, testSessionDriver)
 	s.Require().NoError(err)
 	s.Nil(session.Write("sid", "payload"))
+	s.T().Cleanup(func() { _ = session.Destroy("sid") })
 
-	stored, err := kvGet(context.Background(), session.instance, "custom:sid")
+	stored, err := kvGet(context.Background(), session.instance, prefix+"sid")
 	s.Nil(err)
 	s.Equal([]byte("payload"), stored, "the session was not written under the configured prefix")
 }
