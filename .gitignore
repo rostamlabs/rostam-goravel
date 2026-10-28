@@ -1,0 +1,8 @@
+/.idea/
+/.vscode/
+*.test
+*.out
+/rostam-server*
+/rostam.tar.gz
+/checksums.txt
+/releases.json
