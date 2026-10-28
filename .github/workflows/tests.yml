@@ -1,0 +1,141 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-ed: $unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  conformance:
+    name: go ${{ matrix.go }} against rostam-server (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+
+    # There is no fake server: every cache, lock and session test talks to the
+    # real binary. Without ROSTAM_TEST_SERVER those tests skip, so this lane is
+    # where they actually run.
+    #
+    # Twice per Go version. GitHub's releases/latest skips pre-releases, so a
+    # lane that only saw the stable server would never meet what a beta
+    # changed. The pre-release lane takes the highest version of any kind, by
+    # version rather than date.
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26.x', '1.27.x']
+        channel: [stable, prerelease]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Fetch rostam-server (${{ matrix.channel }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/rostamlabs/rostam/releases?per_page=50" -o releases.json
+
+          # The HIGHEST version, not the newest by date, together with the
+          # asset and the checksums.txt of the SAME release. Plain `sort -V`
+          # ranks 0.7.0-beta7 ABOVE 0.7.0, so the version column's "-" becomes
+          # "~" for the sort, which ranks a pre-release below its release.
+          picked=$(jq -r --arg channel "$CHANNEL" '
+            .[]
+            | select(.draft | not)
+            | select($channel != "stable" or (.prerelease | not))
+            | . as $release
+            | ($release.assets | map({(.name): .browser_download_url}) | add) as $assets
+            | ($release.assets[] | select(.name | endswith("linux_amd64.tar.gz"))) as $asset
+            | [($release.tag_name | ltrimstr("v")), $asset.browser_download_url, $asset.name, ($assets["checksums.txt"] // "")]
+            | @tsv' releases.json \
+            | awk -F'\t' 'BEGIN { OFS = "\t" } { gsub("-", "~", $1); print }' \
+            | sort -t$'\t' -k1,1V | tail -n1 \
+            | awk -F'\t' 'BEGIN { OFS = "\t" } { gsub("~", "-", $1); print }')
+
+          if [ -z "$picked" ]; then
+            echo "::error::no linux_amd64 release to test against"
+            exit 1
+          fi
+
+          IFS=$'\t' read -r version url name sums <<< "$picked"
+          if [ -z "$sums" ]; then
+            echo "::error::release $version ships no checksums.txt"
+            exit 1
+          fi
+
+          echo "downloading $name"
+          curl -fsSL "$url" -o rostam.tar.gz
+          curl -fsSL "$sums" -o checksums.txt
+
+          # The binary this job executes is the one input not taken from a
+          # pinned source, so it is checked against the release's checksums.
+          expected=$(awk -v name="$name" '$2 == name || $2 == "*"name {print $1}' checksums.txt)
+          actual=$(sha256sum rostam.tar.gz | cut -d' ' -f1)
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::checksum mismatch for $name (expected '$expected', got '$actual')"
+            exit 1
+          fi
+
+          tar xzf rostam.tar.gz
+          ./rostam-server --version
+
+      - name: Start it on the binary TCP listener
+        run: |
+          set -euo pipefail
+          ./rostam-server -tcp 127.0.0.1:7411 -insecure &
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/7411) 2>/dev/null; then
+              echo "listening"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "the server never came up"; exit 1
+
+      - name: Run the suite against it
+        env:
+          ROSTAM_TEST_SERVER: 127.0.0.1:7411
+          # This job started that server and nothing else uses it, so the
+          # tests that wipe the whole keyspace may run.
+          ROSTAM_TEST_SERVER_IS_DISPOSABLE: '1'
+          # The runner has Docker, so the container helper is exercised too.
+          ROSTAM_TEST_DOCKER: '1'
+        run: go test -race -count=1 ./...
