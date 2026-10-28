@@ -3,6 +3,7 @@ package facades
 import (
 	"github.com/goravel/framework/contracts/cache"
 	"github.com/goravel/framework/contracts/session"
+	"github.com/goravel/framework/errors"
 	"github.com/rostamlabs/rostam/client"
 
 	"github.com/rostamlabs/rostam-goravel"
@@ -50,5 +51,10 @@ func Instance(connection string) (*client.Client, error) {
 		return nil, rostam.ErrConnectionIsRequired
 	}
 
-	return rostam.GetClient(rostam.App.MakeConfig(), connection)
+	config := rostam.App.MakeConfig()
+	if config == nil {
+		return nil, errors.ConfigFacadeNotSet.SetModule("Rostam")
+	}
+
+	return rostam.GetClient(config, connection)
 }

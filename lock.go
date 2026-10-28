@@ -40,10 +40,15 @@ func (r *Lock) Block(t time.Duration, callback ...func()) bool {
 
 // BlockWithTicker tries to acquire the lock every ticker until t has passed,
 // with a last attempt at the deadline. It gives up early when the store's
-// context is cancelled.
+// context is cancelled. A ticker of zero or less polls once a second, as
+// Block does.
 func (r *Lock) BlockWithTicker(t time.Duration, ticker time.Duration, callback ...func()) bool {
 	if r.Get(callback...) {
 		return true
+	}
+
+	if ticker <= 0 {
+		ticker = time.Second
 	}
 
 	deadline := time.NewTimer(t)
@@ -77,7 +82,17 @@ func (r *Lock) Get(callback ...func()) bool {
 		return true
 	}
 
+	// A callback that panics must not leave the lock held: one taken without
+	// a duration would block every later caller for good.
+	released := false
+	defer func() {
+		if !released {
+			r.Release()
+		}
+	}()
+
 	callback[0]()
+	released = true
 
 	return r.Release()
 }

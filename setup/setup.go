@@ -2,7 +2,10 @@ package main
 
 import (
 	"os"
+	"regexp"
+	"strings"
 
+	contractsmodify "github.com/goravel/framework/contracts/packages/modify"
 	"github.com/goravel/framework/packages"
 	"github.com/goravel/framework/packages/match"
 	"github.com/goravel/framework/packages/modify"
@@ -108,21 +111,43 @@ ROSTAM_TOKEN=
 			return env.IsBootstrapSetup()
 		}, modify.UnregisterProvider(moduleImport, rostamServiceProvider)),
 
+		// Hand the cache default back to the framework's - only while it still
+		// names rostam. A default the application changed since install is its
+		// own, and uninstalling this package must not overwrite it.
+		modify.When(func(_ map[string]any) bool {
+			return defaultIsRostam(cacheConfigPath)
+		}, modify.GoFile(cacheConfigPath).
+			Find(match.Config("cache")).Modify(modify.AddConfig("default", `"memory"`))),
+
 		// Remove the rostam cache store from cache.go if the cache config file exists
 		modify.WhenFileExists(cacheConfigPath,
 			modify.GoFile(cacheConfigPath).
-				Find(match.Config("cache")).Modify(modify.AddConfig("default", `"memory"`)).
 				Find(match.Config("cache.stores")).Modify(modify.RemoveConfig("rostam")).
 				Find(match.Imports()).Modify(modify.RemoveImport(cacheContract), modify.RemoveImport(rostamFacades, "rostamfacades")),
 		),
 
+		// The same for the session default.
+		modify.When(func(_ map[string]any) bool {
+			return defaultIsRostam(sessionConfigPath)
+		}, modify.GoFile(sessionConfigPath).
+			Find(match.Config("session")).Modify(modify.AddConfig("default", `"file"`))),
+
 		// Remove the rostam session driver from session.go if the session config file exists
 		modify.WhenFileExists(sessionConfigPath,
 			modify.GoFile(sessionConfigPath).
-				Find(match.Config("session")).Modify(modify.AddConfig("default", `"file"`)).
 				Find(match.Config("session.drivers")).Modify(modify.RemoveConfig("rostam")).
 				Find(match.Imports()).Modify(modify.RemoveImport(sessionContract), modify.RemoveImport(rostamFacades, "rostamfacades")),
 		),
+
+		// Remove the block install appended to .env and .env.example - and only
+		// while it is still exactly that block: once someone has filled in
+		// their own host or token, those lines are theirs.
+		modify.WhenFileContains(envPath, envContent, modify.Call(func(_ []contractsmodify.Option) error {
+			return removeBlock(envPath, envContent)
+		})),
+		modify.WhenFileContains(envExamplePath, envContent, modify.Call(func(_ []contractsmodify.Option) error {
+			return removeBlock(envExamplePath, envContent)
+		})),
 
 		// Remove rostam connections from database.go
 		modify.GoFile(databaseConfigPath).
@@ -137,4 +162,23 @@ ROSTAM_TOKEN=
 			return content == supportstubs.DatabaseConfig(configPackage, facadesImport, facadesPackage)
 		}, modify.File(databaseConfigPath).Remove()),
 	).Execute()
+}
+
+// defaultStore matches a config file's top-level default naming rostam,
+// however gofmt aligned it.
+var defaultStore = regexp.MustCompile(`"default":\s*"rostam"`)
+
+func defaultIsRostam(path string) bool {
+	content, err := file.GetContent(path)
+
+	return err == nil && defaultStore.MatchString(content)
+}
+
+func removeBlock(path, block string) error {
+	content, err := file.GetContent(path)
+	if err != nil {
+		return err
+	}
+
+	return file.PutContent(path, strings.Replace(content, block, "", 1))
 }

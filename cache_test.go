@@ -127,6 +127,10 @@ func (s *CacheTestSuite) TestGetBool() {
 	s.Equal(true, s.cache.GetBool("test-get-bool", false))
 	s.Nil(s.cache.Put("test-get-bool", false, time.Second))
 	s.Equal(false, s.cache.GetBool("test-get-bool", true))
+	s.Nil(s.cache.Put("test-get-bool", "true", time.Second))
+	s.Equal(true, s.cache.GetBool("test-get-bool", false), "a stored \"true\" must read as true")
+	s.Nil(s.cache.Put("test-get-bool", "not a bool", time.Second))
+	s.Equal(false, s.cache.GetBool("test-get-bool", true))
 }
 
 func (s *CacheTestSuite) TestGetInt() {
@@ -383,7 +387,7 @@ func (s *CacheTestSuite) TestEpochFlushInAnotherProcessIsSeenWithinTheRefresh() 
 
 	s.Nil(cache.Put("name", "Goravel", 10*time.Second))
 
-	elsewhere := &generation{instance: cache.instance, key: cache.prefix + "#epoch", refresh: 0}
+	elsewhere := &generation{instance: cache.instance, key: cache.prefix + "#epoch"}
 	s.Nil(elsewhere.bump(context.Background()))
 
 	s.False(cache.Has("name"))
@@ -396,13 +400,16 @@ func (s *CacheTestSuite) TestCachedGenerationHidesAnotherProcessFlushUntilRefres
 
 	s.Nil(cache.Put("name", "Goravel", 10*time.Second))
 
-	elsewhere := &generation{instance: cache.instance, key: cache.prefix + "#epoch", refresh: 0}
+	elsewhere := &generation{instance: cache.instance, key: cache.prefix + "#epoch"}
 	s.Nil(elsewhere.bump(context.Background()))
 
 	s.True(cache.Has("name"))
 }
 
-func (s *CacheTestSuite) TestLostGenerationIsPushedBackUpNotReused() {
+// Losing the counter reads as a flush, never as a resurrection: the recreated
+// counter starts past every generation in use, this process moves there with
+// everyone else, and nothing an earlier flush retired comes back.
+func (s *CacheTestSuite) TestALostCounterReadsAsAFlushNeverAsAResurrection() {
 	s.config.Add("cache.stores."+testStore+".epoch_refresh", time.Duration(0))
 	resetSharedState()
 	cache := s.newCache(testStore)
@@ -411,14 +418,80 @@ func (s *CacheTestSuite) TestLostGenerationIsPushedBackUpNotReused() {
 	s.True(cache.Flush())
 	s.Nil(cache.Put("current", "after flush", 10*time.Second))
 
-	s.Require().NoError(kvDel(context.Background(), cache.instance, cache.prefix+"#epoch"))
+	before, err := cache.namespace.(*epochNamespace).generation.current(context.Background(), 0)
+	s.Require().NoError(err)
 
-	s.Nil(cache.Get("retired"))
-	s.Equal("after flush", cache.Get("current"))
+	s.Require().NoError(kvDel(context.Background(), cache.instance, cache.prefix+"#epoch"))
+	time.Sleep(20 * time.Millisecond) // the guarantee is the clock's: let it move past the old counter
+
+	s.Nil(cache.Get("retired"), "a key retired by a flush came back")
+	s.Nil(cache.Get("current"), "the lost counter must read as a flush")
 
 	stored, err := kvGet(context.Background(), cache.instance, cache.prefix+"#epoch")
 	s.Require().NoError(err)
-	s.Equal(int64(1), decodeCounter(stored))
+	s.Greater(decodeCounter(stored), before, "the recreated counter did not start past the generations in use")
+
+	s.Nil(cache.Put("current", "after the loss", 10*time.Second))
+	s.Equal("after the loss", cache.Get("current"))
+}
+
+// A process that starts after the counter was lost has no memory of the
+// generations used before it. Recreated from zero, the counter would hand it
+// one of them - and every key that generation retired with it.
+func (s *CacheTestSuite) TestAProcessStartingAfterTheCounterWasLostDoesNotReuseAGeneration() {
+	s.config.Add("cache.stores."+testStore+".epoch_refresh", time.Duration(0))
+	resetSharedState()
+	cache := s.newCache(testStore)
+
+	s.Nil(cache.Put("retired", "before flush", 10*time.Second))
+	s.True(cache.Flush())
+
+	s.Require().NoError(kvDel(context.Background(), cache.instance, cache.prefix+"#epoch"))
+	time.Sleep(20 * time.Millisecond) // the guarantee is the clock's: let it move past the old counter
+
+	resetSharedState() // a new process: nothing remembered
+	fresh := s.newCache(testStore)
+
+	s.Nil(fresh.Get("retired"), "a fresh process read a key a flush had retired")
+	s.True(fresh.Flush())
+	s.Nil(fresh.Get("retired"))
+}
+
+func (s *CacheTestSuite) TestAFlushOnALostCounterDoesNotStartFromOne() {
+	s.config.Add("cache.stores."+testStore+".epoch_refresh", time.Duration(0))
+	resetSharedState()
+	cache := s.newCache(testStore)
+	s.Nil(cache.Put("name", "Goravel", 10*time.Second))
+
+	s.Require().NoError(kvDel(context.Background(), cache.instance, cache.prefix+"#epoch"))
+	resetSharedState()
+	fresh := s.newCache(testStore)
+	s.True(fresh.Flush())
+
+	stored, err := kvGet(context.Background(), fresh.instance, fresh.prefix+"#epoch")
+	s.Require().NoError(err)
+	s.Greater(decodeCounter(stored), int64(1_000_000), "incr_ex on a missing counter created generation 1, which an earlier life of it used")
+}
+
+func (s *CacheTestSuite) TestEachStoreKeepsItsOwnEpochRefresh() {
+	s.config.Add("cache.stores.patient.epoch_refresh", time.Hour)
+	s.config.Add("cache.stores.eager.epoch_refresh", time.Duration(0))
+	resetSharedState()
+	patient := s.newCache("patient")
+	eager := s.newCache("eager")
+
+	s.Nil(patient.Put("name", "Goravel", 10*time.Second))
+	s.Equal("Goravel", eager.Get("name"), "both stores share one prefix")
+
+	elsewhere := &generation{instance: patient.instance, key: patient.prefix + "#epoch"}
+	s.Nil(elsewhere.bump(context.Background()))
+
+	// The patient store asks first and trusts its hour; the eager one then
+	// re-reads, as its own setting says. (After that the patient store sees
+	// the new generation too - the state is shared, and staleness is a bound,
+	// not a promise.)
+	s.Equal("Goravel", patient.Get("name"))
+	s.Nil(eager.Get("name"), "a store with epoch_refresh 0 took the first store's hour")
 }
 
 func (s *CacheTestSuite) TestFlushUnsupportedLeavesEverything() {
@@ -446,6 +519,7 @@ func (s *CacheTestSuite) TestMissingServerConfigIsRefused() {
 
 func (s *CacheTestSuite) TestServersListOverridesHost() {
 	s.config.Add("database.rostam.listed.servers", []string{s.config.GetString("database.rostam.default.host") + ":" + s.config.GetString("database.rostam.default.port")})
+	s.config.Add("database.rostam.listed.token", s.config.GetString("database.rostam.default.token"))
 	s.config.Add("cache.stores.listed.connection", "listed")
 	cache := s.newCache("listed")
 

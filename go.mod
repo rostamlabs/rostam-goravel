@@ -53,6 +53,7 @@ require (
 	github.com/pterm/pterm v0.12.83 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/samber/lo v1.53.0 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/urfave/cli/v3 v3.10.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

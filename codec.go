@@ -63,7 +63,9 @@ func decodeValue(stored []byte) (string, error) {
 	case headerValue:
 		return string(stored[1:]), nil
 	case headerPadded:
-		if len(stored) < 2 || stored[len(stored)-1] != 0x00 {
+		// encodeValue pads exactly one length: a 7-byte payload, 9 bytes in
+		// all. Anything else under this header was not written by it.
+		if len(stored) != counterSize+1 || stored[len(stored)-1] != 0x00 {
 			return "", ErrCorruptValue
 		}
 

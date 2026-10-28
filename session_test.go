@@ -82,7 +82,11 @@ func (s *SessionTestSuite) TestPrefixCanBeConfigured() {
 
 	session, err := NewSession(context.Background(), s.config, testSessionDriver)
 	s.Require().NoError(err)
-	s.Equal("custom:", session.prefix)
+	s.Nil(session.Write("sid", "payload"))
+
+	stored, err := kvGet(context.Background(), session.instance, "custom:sid")
+	s.Nil(err)
+	s.Equal([]byte("payload"), stored, "the session was not written under the configured prefix")
 }
 
 func (s *SessionTestSuite) TestLifetimeUnderOneMinuteIsRefused() {

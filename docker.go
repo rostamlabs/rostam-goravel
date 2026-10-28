@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	contractsconfig "github.com/goravel/framework/contracts/config"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	dockerRepository = "ghcr.io/rostamlabs/rostam"
-	dockerTag        = "0.7"
-	dockerTCPPort    = 7000
+	dockerRepository   = "ghcr.io/rostamlabs/rostam"
+	dockerTag          = "0.7"
+	dockerTCPPort      = 7000
+	dockerReadyTimeout = 2 * time.Minute
 )
 
 // Docker runs a disposable rostam-server container for tests.
@@ -29,12 +31,25 @@ type Docker struct {
 	imageDriver contractsdocker.ImageDriver
 	process     contractsprocess.Process
 	connection  string
+	// internalPort is the TCP port the server listens on inside the
+	// container; cacheConfig.Port becomes the host port it is mapped to.
+	internalPort int
+	// usesServers is set when the connection names its nodes in a servers
+	// list, which Ready then points at the container instead of host/port.
+	usesServers bool
 }
 
 func NewDocker(config contractsconfig.Config, process contractsprocess.Process, store string) (*Docker, error) {
 	connection := config.GetString(fmt.Sprintf("cache.stores.%s.connection", store), "default")
 	configPrefix := fmt.Sprintf("database.rostam.%s", connection)
+	servers := config.GetStringSlice(configPrefix + ".servers")
 	host := config.GetString(configPrefix + ".host")
+	if host == "" && len(servers) > 0 {
+		// The container is reached on the first node's host.
+		if splitHost, _, err := net.SplitHostPort(servers[0]); err == nil {
+			host = splitHost
+		}
+	}
 	if host == "" {
 		return nil, ErrServersNotConfigured.Args(connection, configPrefix, configPrefix)
 	}
@@ -65,7 +80,9 @@ func NewDocker(config contractsconfig.Config, process contractsprocess.Process, 
 			ExposedPorts: []string{strconv.Itoa(dockerTCPPort)},
 			Args:         args,
 		}, process),
-		process: process,
+		process:      process,
+		internalPort: dockerTCPPort,
+		usesServers:  len(servers) > 0,
 	}, nil
 }
 
@@ -76,7 +93,7 @@ func (r *Docker) Build() error {
 
 	config := r.imageDriver.Config()
 	r.cacheConfig.ContainerID = config.ContainerID
-	r.cacheConfig.Port = cast.ToInt(supportdocker.ExposedPort(config.ExposedPorts, strconv.Itoa(r.cacheConfig.Port)))
+	r.cacheConfig.Port = cast.ToInt(supportdocker.ExposedPort(config.ExposedPorts, strconv.Itoa(r.internalPort)))
 
 	return nil
 }
@@ -100,8 +117,20 @@ func (r *Docker) Fresh() error {
 	return nil
 }
 
+// Image swaps the image the container is built from. Its first exposed port
+// - "7000", or "host:container" - is the one the server listens on.
 func (r *Docker) Image(image contractsdocker.Image) {
 	r.imageDriver = testingdocker.NewImageDriver(image, r.process)
+
+	if len(image.ExposedPorts) > 0 {
+		exposed := image.ExposedPorts[0]
+		if i := strings.LastIndex(exposed, ":"); i >= 0 {
+			exposed = exposed[i+1:]
+		}
+		if port, err := strconv.Atoi(strings.SplitN(exposed, "/", 2)[0]); err == nil {
+			r.internalPort = port
+		}
+	}
 }
 
 func (r *Docker) Ready() error {
@@ -126,7 +155,8 @@ func (r *Docker) Shutdown() error {
 	return r.imageDriver.Shutdown()
 }
 
-// connect waits up to two minutes for the server to answer.
+// connect waits up to two minutes in all for the server to answer: each
+// attempt and each pause between attempts is cut short by the same deadline.
 func (r *Docker) connect() (*client.Client, error) {
 	instance, err := client.New(client.Config{
 		Servers:   []string{net.JoinHostPort(r.cacheConfig.Host, strconv.Itoa(r.cacheConfig.Port))},
@@ -136,22 +166,38 @@ func (r *Docker) connect() (*client.Client, error) {
 		return nil, err
 	}
 
-	for range 60 {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, err = instance.Exists(ctx, []byte("rostam-goravel:ready"))
-		cancel()
+	deadline, cancel := context.WithTimeout(context.Background(), dockerReadyTimeout)
+	defer cancel()
+
+	for {
+		attempt, cancelAttempt := context.WithTimeout(deadline, 2*time.Second)
+		_, err = instance.Exists(attempt, []byte("rostam-goravel:ready"))
+		cancelAttempt()
 		if err == nil {
 			return instance, nil
 		}
 
-		time.Sleep(2 * time.Second)
+		select {
+		case <-deadline.Done():
+			_ = instance.Close()
+
+			return nil, err
+		case <-time.After(2 * time.Second):
+		}
 	}
-
-	_ = instance.Close()
-
-	return nil, err
 }
 
+// resetConfigPort points the connection at the container: its port, and its
+// servers list when the connection names its nodes that way - otherwise the
+// list would still win over host and port, and tests would reach the old
+// server rather than the disposable one.
 func (r *Docker) resetConfigPort() {
 	r.config.Add(fmt.Sprintf("database.rostam.%s.port", r.connection), r.cacheConfig.Port)
+
+	if r.usesServers {
+		r.config.Add(
+			fmt.Sprintf("database.rostam.%s.servers", r.connection),
+			[]string{net.JoinHostPort(r.cacheConfig.Host, strconv.Itoa(r.cacheConfig.Port))},
+		)
+	}
 }

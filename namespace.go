@@ -32,7 +32,8 @@ func newNamespace(mode, store, prefix string, instance *client.Client, connectio
 	case FlushEpoch, "":
 		return &epochNamespace{
 			prefix:     prefix,
-			generation: sharedGeneration(instance, connection, prefix+"#epoch", epochRefresh),
+			refresh:    epochRefresh,
+			generation: sharedGeneration(instance, connection, prefix+"#epoch"),
 		}, nil
 	case FlushServer:
 		return &serverNamespace{prefix: prefix, instance: instance}, nil
@@ -51,14 +52,17 @@ func prefixed(prefix, key string) string {
 	return prefix + ":" + key
 }
 
-// epochNamespace stores keys as "<prefix>:<generation>:<key>".
+// epochNamespace stores keys as "<prefix>:<generation>:<key>". The
+// generation's state is shared per connection and prefix; how stale this
+// store lets it get is its own.
 type epochNamespace struct {
 	prefix     string
+	refresh    time.Duration
 	generation *generation
 }
 
 func (r *epochNamespace) qualify(ctx context.Context, key string) (string, error) {
-	current, err := r.generation.current(ctx)
+	current, err := r.generation.current(ctx, r.refresh)
 	if err != nil {
 		return "", err
 	}
@@ -105,8 +109,8 @@ func (r *staticNamespace) flush(context.Context) error {
 // current one inside a process.
 var generations sync.Map
 
-func sharedGeneration(instance *client.Client, connection, key string, refresh time.Duration) *generation {
-	fresh := &generation{instance: instance, key: key, refresh: refresh}
+func sharedGeneration(instance *client.Client, connection, key string) *generation {
+	fresh := &generation{instance: instance, key: key}
 	existing, _ := generations.LoadOrStore(connection+"\x00"+key, fresh)
 
 	return existing.(*generation)
@@ -114,16 +118,25 @@ func sharedGeneration(instance *client.Client, connection, key string, refresh t
 
 // generation caches a counter stored on the server.
 //
-// refresh bounds how stale the cached number may be: a flush in another
-// process is seen at most refresh later (0 re-reads on every call, a negative
-// value never re-reads). The number never goes backwards inside a process:
-// if the server's copy comes back lower than one this process has seen, the
-// counter was evicted or wiped, and it is pushed back up rather than reused,
-// because reusing an old generation would resurrect the keys a flush retired.
+// Reusing an old generation would resurrect every key a flush retired, so the
+// number must only ever go forward - including across a counter the server
+// evicted or a flush=server store wiped. Two things hold that:
+//
+//   - A missing counter is created from the clock in microseconds, never from
+//     zero. A flush adds one, so every generation in use sits within a flush
+//     count of the moment its counter was created; a counter created later
+//     starts past all of them, unless flushes outran the clock - more than one
+//     per microsecond, sustained, which a round trip per flush rules out.
+//   - Inside a process, a server copy lower than one already seen is pushed
+//     back up rather than taken, which covers a process that has not yet
+//     noticed the counter was recreated.
+//
+// How stale the cached number may be is the caller's: a flush in another
+// process is seen at most that long later (0 re-reads on every call, a
+// negative value never re-reads).
 type generation struct {
 	instance *client.Client
 	key      string
-	refresh  time.Duration
 
 	mu       sync.Mutex
 	loaded   bool
@@ -131,11 +144,11 @@ type generation struct {
 	value    int64
 }
 
-func (r *generation) current(ctx context.Context) (int64, error) {
+func (r *generation) current(ctx context.Context, refresh time.Duration) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.loaded && (r.refresh < 0 || (r.refresh > 0 && time.Since(r.loadedAt) < r.refresh)) {
+	if r.loaded && (refresh < 0 || (refresh > 0 && time.Since(r.loadedAt) < refresh)) {
 		return r.value, nil
 	}
 
@@ -160,6 +173,12 @@ func (r *generation) bump(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// incr_ex on a missing counter would create it at one, a generation an
+	// earlier life of this counter may well have used. Seed it first.
+	if err := r.seed(ctx); err != nil {
+		return err
+	}
+
 	bumped, err := r.instance.IncrEx(ctx, []byte(r.key), 1, 0)
 	if err != nil {
 		return err
@@ -180,7 +199,13 @@ func (r *generation) bump(ctx context.Context) error {
 func (r *generation) read(ctx context.Context) (int64, error) {
 	stored, err := kvGet(ctx, r.instance, r.key)
 	if errors.Is(err, client.ErrNotFound) {
-		return 0, nil
+		if err := r.seed(ctx); err != nil {
+			return 0, err
+		}
+
+		// Read back rather than trust the seed: another process may have
+		// created the counter first, and every process must agree on it.
+		stored, err = kvGet(ctx, r.instance, r.key)
 	}
 	if err != nil {
 		return 0, err
@@ -190,6 +215,14 @@ func (r *generation) read(ctx context.Context) (int64, error) {
 	}
 
 	return decodeCounter(stored), nil
+}
+
+// seed creates the counter from the clock if it does not exist; an existing
+// one is left alone.
+func (r *generation) seed(ctx context.Context) error {
+	_, err := r.instance.SetNX(ctx, []byte(r.key), encodeCounter(time.Now().UnixMicro()), 0)
+
+	return err
 }
 
 func (r *generation) remember(value int64) {

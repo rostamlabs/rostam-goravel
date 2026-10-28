@@ -152,12 +152,10 @@ func (r *Cache) GetBool(key string, def ...bool) bool {
 	if len(def) == 0 {
 		def = append(def, false)
 	}
-	res := r.Get(key, def[0])
-	if val, ok := res.(string); ok {
-		return val == "1"
-	}
-
-	return cast.ToBool(res)
+	// "1" and "0" are how a bool is stored; "true", "false" and the rest of
+	// strconv.ParseBool's spellings are what a caller may have stored as a
+	// string. Anything else reads as false.
+	return cast.ToBool(r.Get(key, def[0]))
 }
 
 func (r *Cache) GetInt(key string, def ...int) int {
@@ -283,9 +281,11 @@ func (r *Cache) convertToCounter(key, qualified string) (bool, error) {
 		return true, nil
 	}
 
+	// A key with 0ms left is still a key with an expiry; written with a zero
+	// TTL it would never expire at all.
 	var ttl time.Duration
 	if remaining >= 0 {
-		ttl = wireTTL(time.Duration(remaining) * time.Millisecond)
+		ttl = time.Duration(max(remaining, 1)) * time.Millisecond
 	}
 
 	// A lost race leaves the value to whoever changed it; the caller retries.

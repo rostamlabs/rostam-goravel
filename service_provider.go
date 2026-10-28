@@ -47,7 +47,12 @@ func (r *ServiceProvider) Register(app foundation.Application) {
 			return nil, errors.ConfigFacadeNotSet.SetModule(errors.ModuleCache)
 		}
 
-		return NewCache(context.Background(), config, app.MakeProcess(), parameters["store"].(string))
+		store, ok := parameters["store"].(string)
+		if !ok || store == "" {
+			return nil, ErrStoreIsRequired
+		}
+
+		return NewCache(context.Background(), config, app.MakeProcess(), store)
 	})
 	app.BindWith(BindingSession, func(app foundation.Application, parameters map[string]any) (any, error) {
 		config := app.MakeConfig()
@@ -55,7 +60,12 @@ func (r *ServiceProvider) Register(app foundation.Application) {
 			return nil, errors.ConfigFacadeNotSet.SetModule(errors.ModuleSession)
 		}
 
-		return NewSession(context.Background(), config, parameters["driver"].(string))
+		driver, ok := parameters["driver"].(string)
+		if !ok || driver == "" {
+			return nil, ErrSessionDriverIsRequired
+		}
+
+		return NewSession(context.Background(), config, driver)
 	})
 }
 

@@ -107,6 +107,8 @@ func TestDecodeValueRejectsForeignBytes(t *testing.T) {
 		"unknown header":       {0x07, 'x'},
 		"padded without tail":  {headerPadded, 'x', 'y'},
 		"padded header alone":  {headerPadded},
+		"padded, too short":    {headerPadded, 'a', 'b', 0x00},
+		"padded, too long":     {headerPadded, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 0x00},
 		"plain text by others": []byte("hello"),
 	} {
 		t.Run(name, func(t *testing.T) {

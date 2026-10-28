@@ -83,9 +83,16 @@ jobs:
           fi
 
           # Notes run from the highest version tag this one descends from and,
-          # for a stable release, the highest STABLE one.
+          # for a stable release, the highest STABLE one. Reachable from the
+          # tagged commit itself, not its first parent, so a release tagged on
+          # a merge sees the tags of both sides; the tag and anything else on
+          # the same commit are skipped.
+          tagged=$(git rev-parse "$TAG^{commit}")
           previous=''
-          for candidate in $(git -c versionsort.suffix=- tag --merged "$TAG^" --list 'v[0-9]*' --sort=-version:refname 2>/dev/null || true); do
+          for candidate in $(git -c versionsort.suffix=- tag --merged "$TAG" --list 'v[0-9]*' --sort=-version:refname 2>/dev/null || true); do
+            if [ "$(git rev-parse "$candidate^{commit}")" = "$tagged" ]; then
+              continue
+            fi
             if [ "$prerelease" = false ] && printf '%s' "$candidate" | grep -q -- '-'; then
               continue
             fi

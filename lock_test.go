@@ -89,7 +89,26 @@ func (s *LockTestSuite) TestBlockGivesUpAtTheDeadline() {
 
 	start := time.Now()
 	s.False(s.cache.Lock("lock").BlockWithTicker(300*time.Millisecond, 50*time.Millisecond))
+	s.GreaterOrEqual(time.Since(start), 250*time.Millisecond, "it gave up before its deadline")
 	s.Less(time.Since(start), 2*time.Second)
+}
+
+func (s *LockTestSuite) TestBlockWithANonPositiveTickerPollsInsteadOfPanicking() {
+	s.True(s.cache.Lock("lock", 300*time.Millisecond).Get())
+
+	s.NotPanics(func() {
+		s.True(s.cache.Lock("lock").BlockWithTicker(3*time.Second, 0))
+	})
+}
+
+func (s *LockTestSuite) TestACallbackThatPanicsStillReleasesTheLock() {
+	s.Panics(func() {
+		s.cache.Lock("lock").Get(func() {
+			panic("the work failed")
+		})
+	})
+
+	s.True(s.cache.Lock("lock").Get(), "a panicking callback left a lock without a duration held for good")
 }
 
 func (s *LockTestSuite) TestBlockRunsTheCallback() {
@@ -111,6 +130,7 @@ func (s *LockTestSuite) TestBlockStopsWhenTheContextIsCancelled() {
 
 	start := time.Now()
 	s.False(waiting.Block(10 * time.Second))
+	s.GreaterOrEqual(time.Since(start), 80*time.Millisecond, "it gave up before the context was cancelled")
 	s.Less(time.Since(start), 5*time.Second)
 }
 

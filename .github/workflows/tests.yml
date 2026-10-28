@@ -71,8 +71,10 @@ jobs:
           CHANNEL: ${{ matrix.channel }}
         run: |
           set -euo pipefail
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/rostamlabs/rostam/releases?per_page=50" -o releases.json
+          # Every page, not the first: the highest version need not be among
+          # the most recently created releases - a patch to an older line is
+          # newer by date and lower by version.
+          gh api --paginate "repos/rostamlabs/rostam/releases?per_page=100" --jq '.[]' | jq -s . > releases.json
 
           # The HIGHEST version, not the newest by date, together with the
           # asset and the checksums.txt of the SAME release. Plain `sort -V`

@@ -38,9 +38,22 @@ The installer:
   `config/session.go`, and makes both the default
 - appends the `ROSTAM_*` variables to `.env` and `.env.example`
 
-`go run github.com/rostamlabs/rostam-goravel/setup uninstall` reverses it.
+`go run github.com/rostamlabs/rostam-goravel/setup uninstall` reverses it. It
+hands a default back to the framework's only while it still names `rostam`, and
+removes the `ROSTAM_*` block only while it is unchanged, so values you have
+filled in stay.
 
-To configure it by hand instead:
+To configure it by hand instead, register the provider first. Without it the
+facades below answer `ErrServiceProviderNotRegistered`:
+
+```go
+// bootstrap/providers.go (or the providers list in config/app.go)
+import "github.com/rostamlabs/rostam-goravel"
+
+&rostam.ServiceProvider{},
+```
+
+then the connection, the store and the session driver:
 
 ```go
 // config/database.go
@@ -159,11 +172,19 @@ carries a generation number (`<prefix>:<generation>:<key>`), and `Flush()`
 increments the counter at `<prefix>#epoch`. The old keys become unreachable at
 once and leave under their TTLs or the server's eviction.
 
-- Processes cache the generation for `epoch_refresh`, so a flush made elsewhere
-  is seen at most that long afterwards. Inside one process it is seen at once.
-- The generation never moves backwards. A counter that was evicted or deleted
-  would read back lower, and reusing an old generation would make everything it
-  retired reachable again, so it is pushed back up instead.
+- Processes cache the generation for `epoch_refresh`, each store with its own
+  setting, so a flush made elsewhere is seen at most that long afterwards.
+  Inside one process it is seen at once.
+- A generation is never reused, because reusing one would make everything it
+  retired reachable again. The counter can still be evicted, or wiped by a
+  `flush: "server"` store, so it is never created from zero: a missing counter
+  is created from the clock in microseconds, and a flush adds one. Every
+  generation used so far sits within a flush count of the moment its counter
+  was created, so a recreated counter starts past all of them. The one
+  assumption is that flushes do not outrun the clock, at more than one per
+  microsecond sustained, and a round trip per flush rules that out. A process
+  that saw a higher number before the counter was recreated also pushes it back
+  up rather than taking the lower one.
 - Sessions and locks are not under the generation, so a cache flush neither logs
   anyone out nor frees a lock somebody holds.
 
